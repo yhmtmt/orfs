@@ -214,11 +214,7 @@ def parse_tunable_variables():
 
 def parse_config(
     config,
-    base_dir,
-    platform,
-    sdc_original,
     constraints_sdc,
-    fr_original,
     fastroute_tcl,
     path=os.getcwd(),
 ):
@@ -226,6 +222,8 @@ def parse_config(
     Parse configuration received from tune into make variables.
     """
     options = ""
+    globals = {}
+    
     sdc = {}
     fast_route = {}
     flow_variables = parse_tunable_variables()
@@ -246,6 +244,12 @@ def parse_config(
                     "[WARNING TUN-0013] Non-flatten the designs are not "
                     "fully supported, ignoring _SYNTH_FLATTEN parameter."
                 )
+            elif key== "__globals__":
+                #I added the entry to pass the global variables to the tuner instances.
+                globals.update(value)
+                platform = globals.get("args").platform
+                sdc_original = globals.get("sdc_original")
+                fr_original = globals.get("fr_original")
         # Default case is VAR=VALUE
         else:
             # Sanity check: ignore all flow variables that are not tunable
@@ -259,7 +263,7 @@ def parse_config(
     if fast_route:
         write_fast_route(fast_route, path, platform, fr_original, fastroute_tcl)
         options += f" FASTROUTE_TCL={path}/{fastroute_tcl}"
-    return options
+    return options, globals
 
 
 def run_command(
@@ -297,6 +301,7 @@ def openroad(
     """
     Run OpenROAD-flow-scripts with a given set of parameters.
     """
+   
     # Make sure path ends in a slash, i.e., is a folder
     flow_variant = f"{args.experiment}/{flow_variant}"
     log_path = os.path.abspath(
@@ -369,8 +374,12 @@ def read_metrics(file_name, stop_stage):
     before "finish", then no need to extract the metrics from the route stage,
     so set them to 0
     """
-    with open(file_name) as file:
-        data = json.load(file)
+    try:
+        with open(file_name) as file:
+            data = json.load(file)
+    except:
+        return None
+    
     clk_period = 9999999
     worst_slack = "ERR"
     total_power = "ERR"
@@ -394,6 +403,7 @@ def read_metrics(file_name, stop_stage):
             wirelength = value["route__wirelength"]
         if stage_name == stop_stage and "timing__setup__ws" in value:
             worst_slack = value["timing__setup__ws"]
+            worst_slack = "ERR" if worst_slack < 0 else worst_slack            
         if stage_name == stop_stage and "power__total" in value:
             total_power = value["power__total"]
         if stage_name == stop_stage and "design__instance__utilization" in value:
@@ -592,7 +602,7 @@ def read_config(file_name, mode, algorithm):
 def prepare_ray_server(args):
     """
     Prepares Ray server and returns basic directories.
-    """
+    """   
     # Connect to remote Ray server if any, otherwise will run locally
     if args.server is not None:
         # Connect to ray server before first remote execution.
@@ -607,7 +617,7 @@ def prepare_ray_server(args):
     )
     local_dir = f"logs/{args.platform}/{args.design}"
     local_dir = os.path.join(orfs_flow_dir, local_dir)
-    install_path = os.path.abspath(os.path.join(orfs_flow_dir, "../tools/install"))
+    install_path = os.path.abspath(os.path.join(orfs_flow_dir, "../tools/install"))  
     return local_dir, orfs_flow_dir, install_path
 
 
@@ -622,15 +632,12 @@ def openroad_distributed(
     variant=None,
 ):
     """Simple wrapper to run openroad distributed with Ray."""
-    config = parse_config(
+    config, globals = parse_config(
         config=config,
-        base_dir=repo_dir,
-        platform=args.platform,
-        sdc_original=sdc_original,
         constraints_sdc=CONSTRAINTS_SDC,
-        fr_original=fr_original,
         fastroute_tcl=FASTROUTE_TCL,
     )
+   
     if variant is None:
         variant = config.replace(" ", "_").replace("=", "_")
     t = time.time()

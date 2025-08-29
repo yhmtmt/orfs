@@ -100,13 +100,6 @@ from autotuner.utils import (
 METRIC = "metric"
 # The worst of optimized metric
 ERROR_METRIC = 9e99
-# Path to the FLOW_HOME directory
-ORFS_FLOW_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../../../../flow")
-)
-# Global variable for args
-args = None
-
 
 class AutoTunerBase(tune.Trainable):
     """
@@ -117,20 +110,17 @@ class AutoTunerBase(tune.Trainable):
         """
         Setup current experiment step.
         """
-        # We create the following directory structure:
-        #      1/     2/         3/       4/           5/
-        # <repo>/<logs>/<platform>/<design>/<experiment/<cwd>
-        self.repo_dir = os.path.abspath(LOCAL_DIR + "/../" * 4)
-        self.parameters = parse_config(
+        self.parameters, self.globals = parse_config(
             config=config,
-            base_dir=self.repo_dir,
-            platform=args.platform,
-            sdc_original=SDC_ORIGINAL,
             constraints_sdc=CONSTRAINTS_SDC,
-            fr_original=FR_ORIGINAL,
             fastroute_tcl=FASTROUTE_TCL,
             path=os.getcwd(),
         )
+        # We create the following directory structure:
+        #      1/     2/         3/       4/           5/
+        # <repo>/<logs>/<platform>/<design>/<experiment/<cwd>
+        self.repo_dir = os.path.abspath(self.globals.get("local_dir") + "/../" * 4)
+        
         self.step_ = 0
         self.variant = f"variant-{self.__class__.__name__}-{self.trial_id}-or"
         # Do a valid config check here, since we still have the config in a
@@ -145,17 +135,18 @@ class AutoTunerBase(tune.Trainable):
         # if not a valid config, then don't run and pass back an error
         if not self.is_valid_config:
             return {METRIC: ERROR_METRIC, "effective_clk_period": "-", "num_drc": "-"}
+        
         self._variant = f"{self.variant}-{self.step_}"
         metrics_file = openroad(
-            args=args,
+            args=self.globals.get("args"),
             base_dir=self.repo_dir,
             parameters=self.parameters,
             flow_variant=self._variant,
-            install_path=INSTALL_PATH,
+            install_path=self.globals.get("install_path"),
         )
         self.step_ += 1
         (score, effective_clk_period, num_drc, die_area) = self.evaluate(
-            read_metrics(metrics_file, args.stop_stage)
+            read_metrics(metrics_file, self.globals.get("args").stop_stage)
         )
         # Feed the score back to Tune.
         # return must match 'metric' used in tune.run()
@@ -164,6 +155,7 @@ class AutoTunerBase(tune.Trainable):
             "effective_clk_period": effective_clk_period,
             "num_drc": num_drc,
             "die_area": die_area,
+            "file" : metrics_file
         }
 
     def evaluate(self, metrics):
@@ -178,6 +170,8 @@ class AutoTunerBase(tune.Trainable):
             return (ERROR_METRIC, "-", "-", "-")
         effective_clk_period = metrics["clk_period"] - metrics["worst_slack"]
         num_drc = metrics["num_drc"]
+        clk_period=metrics["clk_period"]
+        worst_slack=metrics["worst_slack"]
         gamma = effective_clk_period / 10
         score = effective_clk_period
         score = score * (100 / self.step_) + gamma * num_drc
@@ -216,7 +210,7 @@ class PPAImprov(AutoTunerBase):
     """
 
     @classmethod
-    def get_ppa(cls, metrics):
+    def get_ppa(cls, reference, metrics):
         """
         Compute PPA term for evaluate.
         """
@@ -225,7 +219,7 @@ class PPAImprov(AutoTunerBase):
         eff_clk_period = metrics["clk_period"]
         if metrics["worst_slack"] < 0:
             eff_clk_period -= metrics["worst_slack"]
-
+            
         eff_clk_period_ref = reference["clk_period"]
         if reference["worst_slack"] < 0:
             eff_clk_period_ref -= reference["worst_slack"]
@@ -245,11 +239,12 @@ class PPAImprov(AutoTunerBase):
         return ppa_upper_bound - ppa
 
     def evaluate(self, metrics):
+        reference = self.globals.get("reference")                
         error = "ERR" in metrics.values() or "ERR" in reference.values()
         not_found = "N/A" in metrics.values() or "N/A" in reference.values()
         if error or not_found:
             return (ERROR_METRIC, "-", "-", "-")
-        ppa = self.get_ppa(metrics)
+        ppa = self.get_ppa(reference, metrics)
         gamma = ppa / 10
         score = ppa * (self.step_ / 100) ** (-1) + (gamma * metrics["num_drc"])
         effective_clk_period = metrics["clk_period"] - metrics["worst_slack"]
@@ -539,26 +534,35 @@ def save_best(results):
     """
     Save best configuration of parameters found.
     """
-    best_config = results.best_config
+    best_config = results.best_config.copy()
+    best_result = results.best_result.copy();
+    
     best_config["best_result"] = results.best_result[METRIC]
+    best_metric_path = best_result["file"]
+    args=best_config.get("__globals__").get("args")
+    local_dir=best_config.get("__globals__").get("local_dir")
+    best_config.pop("__globals__")
+    best_result["config"].pop("__globals__")
     trial_id = results.best_trial.trial_id
-    new_best_path = f"{LOCAL_DIR}/{args.experiment}/"
+    new_best_path = f"{local_dir}/{args.experiment}/"
     new_best_path += f"autotuner-best-{trial_id}.json"
     with open(new_best_path, "w") as new_best_file:
-        json.dump(best_config, new_best_file, indent=4)
-    print(f"[INFO TUN-0003] Best parameters written to {new_best_path}")
+        json.dump(results.best_result, new_best_file, indent=4)
+    
+    print(f"[INFO TUN-0003] Best results written to {new_best_path}")
+    print(f"[INFO TUN-0040] Best metrics written to {best_metric_path}")
 
 
-def sweep():
+def sweep(args, config_dict, globals, local_dir, orfs_flow_dir, sdc_original, fr_original, install_path):
     """Run sweep of parameters"""
     if args.server is not None:
         # For remote sweep we create the following directory structure:
         #      1/     2/         3/       4/
         # <repo>/<logs>/<platform>/<design>/
-        repo_dir = os.path.abspath(LOCAL_DIR + "/../" * 4)
+        repo_dir = os.path.abspath(local_dir + "/../" * 4)
     else:
-        repo_dir = os.path.abspath(os.path.join(ORFS_FLOW_DIR, ".."))
-    print(f"[INFO TUN-0012] Log folder {LOCAL_DIR}.")
+        repo_dir = os.path.abspath(os.path.join(orfs_flow_dir, ".."))
+    print(f"[INFO TUN-0012] Log folder {local_dir}.")
     queue = Queue()
     parameter_list = list()
     for name, content in config_dict.items():
@@ -574,7 +578,8 @@ def sweep():
         temp = dict()
         for value in parameter:
             temp.update(value)
-        queue.put([args, repo_dir, temp, SDC_ORIGINAL, FR_ORIGINAL, INSTALL_PATH])
+        temp.update({"__globals__":globals})
+        queue.put([args, repo_dir, temp, sdc_original, fr_original, install_path])
     workers = [consumer.remote(queue) for _ in range(args.jobs)]
     print("[INFO TUN-0009] Waiting for results.")
     ray.get(workers)
@@ -582,9 +587,9 @@ def sweep():
 
 
 def main():
-    global args, SDC_ORIGINAL, FR_ORIGINAL, LOCAL_DIR, INSTALL_PATH, ORFS_FLOW_DIR, config_dict, reference, best_params
+    global config_dict
     args = parse_arguments()
-
+  
     # Read config and original files before handling where to run in case we
     # need to upload the files.
     config_dict, SDC_ORIGINAL, FR_ORIGINAL = read_config(
@@ -592,7 +597,23 @@ def main():
     )
 
     LOCAL_DIR, ORFS_FLOW_DIR, INSTALL_PATH = prepare_ray_server(args)
-
+    
+        # The global variables declared in main() do not exist in the execution instances. I embed the global variables into config_dict which is the only parameter passed to setup method of AutoTunerBase. The code is a quick fix the global variables are still used in other parts of the code.
+    reference = None
+    if hasattr(args, "reference"):
+        reference = read_metrics(args.reference, args.stop_stage)
+    print(f"reference={reference}")
+    
+    globals = {
+        "local_dir": LOCAL_DIR,
+        "sdc_original": SDC_ORIGINAL,
+        "fr_original": FR_ORIGINAL,
+        "install_path": INSTALL_PATH,
+        "orfs_flow_dir": ORFS_FLOW_DIR,
+        "reference":reference,
+        "args": args,
+    }
+    
     if args.mode == "tune":
         best_params = set_best_params(args.platform, args.design)
         search_algo = set_algorithm(
@@ -605,10 +626,6 @@ def main():
             config_dict,
         )
         TrainClass = set_training_class(args.eval)
-        # PPAImprov requires a reference file to compute training scores.
-        if args.eval == "ppa-improv":
-            reference = read_metrics(args.reference, args.stop_stage)
-
         tune_args = dict(
             name=args.experiment,
             metric=METRIC,
@@ -629,8 +646,14 @@ def main():
         else:
             tune_args["search_alg"] = search_algo
             tune_args["scheduler"] = AsyncHyperBandScheduler()
+        
+        config_dict.update({
+            "__globals__": globals 
+        })
+
         if args.algorithm != "ax":
             tune_args["config"] = config_dict
+    
         analysis = tune.run(TrainClass, **tune_args)
 
         task_id = save_best.remote(analysis)
@@ -641,8 +664,10 @@ def main():
         if analysis.best_result[METRIC] == ERROR_METRIC:
             print("[ERROR TUN-0016] No successful runs found.")
             sys.exit(16)
+
+            
     elif args.mode == "sweep":
-        sweep()
+        sweep(args, config_dict, globals, LOCAL_DIR, ORFS_FLOW_DIR, SDC_ORIGINAL, FR_ORIGINAL, INSTALL_PATH)
 
 
 if __name__ == "__main__":
