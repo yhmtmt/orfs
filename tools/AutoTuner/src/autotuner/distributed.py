@@ -110,6 +110,7 @@ class AutoTunerBase(tune.Trainable):
         """
         Setup current experiment step.
         """
+      
         self.parameters, self.globals = parse_config(
             config=config,
             constraints_sdc=CONSTRAINTS_SDC,
@@ -134,9 +135,10 @@ class AutoTunerBase(tune.Trainable):
 
         # if not a valid config, then don't run and pass back an error
         if not self.is_valid_config:
-            return {METRIC: ERROR_METRIC, "effective_clk_period": "-", "num_drc": "-"}
+            return {METRIC: ERROR_METRIC, "effective_clk_period" : "-", "total_power" : "-", "die-area" : "-", "num_drc": "-"}
         
         self._variant = f"{self.variant}-{self.step_}"
+        print(f"parameters@step={self.parameters}")
         metrics_file = openroad(
             args=self.globals.get("args"),
             base_dir=self.repo_dir,
@@ -145,7 +147,7 @@ class AutoTunerBase(tune.Trainable):
             install_path=self.globals.get("install_path"),
         )
         self.step_ += 1
-        (score, effective_clk_period, num_drc, die_area) = self.evaluate(
+        (score, effective_clk_period, total_power, die_area, num_drc) = self.evaluate(
             read_metrics(metrics_file, self.globals.get("args").stop_stage)
         )
         # Feed the score back to Tune.
@@ -153,8 +155,9 @@ class AutoTunerBase(tune.Trainable):
         return {
             METRIC: score,
             "effective_clk_period": effective_clk_period,
-            "num_drc": num_drc,
+            "total_power": total_power,
             "die_area": die_area,
+            "num_drc": num_drc,
             "file" : metrics_file
         }
 
@@ -163,19 +166,23 @@ class AutoTunerBase(tune.Trainable):
         User-defined evaluation function.
         It can change in any form to minimize the score (return value).
         Default evaluation function optimizes effective clock period.
+        Timing driven metric (effective_clk_period) is used. 
         """
         error = "ERR" in metrics.values()
         not_found = "N/A" in metrics.values()
-        if error or not_found:
-            return (ERROR_METRIC, "-", "-", "-")
-        effective_clk_period = metrics["clk_period"] - metrics["worst_slack"]
         num_drc = metrics["num_drc"]
+        
+        if num_drc != 0 or error or not_found:
+            return (ERROR_METRIC, "-", "-", "-", "-")
+        effective_clk_period = metrics["clk_period"];
+        if metrics["worst_slack"] < 0:
+            effective_clk_period -= metrics["worst_slack"]
+            
         clk_period=metrics["clk_period"]
         worst_slack=metrics["worst_slack"]
-        gamma = effective_clk_period / 10
         score = effective_clk_period
-        score = score * (100 / self.step_) + gamma * num_drc
-        return (score, effective_clk_period, num_drc, metrics["die_area"])
+        
+        return (score, effective_clk_period, metrics["total_power"], metrics["die_area"], num_drc)
 
     def _is_valid_config(self, config):
         """
@@ -214,7 +221,13 @@ class PPAImprov(AutoTunerBase):
         """
         Compute PPA term for evaluate.
         """
-        coeff_perform, coeff_power, coeff_area = 10000, 100, 100
+        args = self.globals.get("args")
+        coeff_perform, coeff_power, coeff_area = args.coeff_perform, args.coeff_power, args.globals.coeff_area
+        #normalize as one
+        fac = 1.0 / (coeff_perform + coeff_power + coeff_area)
+        coeff_perform *= fac
+        coeff_power *= fac
+        coeff_area *= fac
 
         eff_clk_period = metrics["clk_period"]
         if metrics["worst_slack"] < 0:
@@ -224,15 +237,11 @@ class PPAImprov(AutoTunerBase):
         if reference["worst_slack"] < 0:
             eff_clk_period_ref -= reference["worst_slack"]
 
-        def percent(x_1, x_2):
-            return (x_1 - x_2) / x_1 * 100
-
-        performance = percent(eff_clk_period_ref, eff_clk_period)
-        power = percent(reference["total_power"], metrics["total_power"])
-        area = percent(100 - reference["final_util"], 100 - metrics["final_util"])
+        performance =  eff_clk_period / eff_clk_period_ref;
+        power = metrics["total_power"] / reference["total_power"];
+        area = (100 - metrics["final_util"]) / (100 - reference["final_util"])
 
         # Lower values of PPA are better.
-        ppa_upper_bound = (coeff_perform + coeff_power + coeff_area) * 100
         ppa = performance * coeff_perform
         ppa += power * coeff_power
         ppa += area * coeff_area
@@ -243,13 +252,14 @@ class PPAImprov(AutoTunerBase):
         error = "ERR" in metrics.values() or "ERR" in reference.values()
         not_found = "N/A" in metrics.values() or "N/A" in reference.values()
         if error or not_found:
-            return (ERROR_METRIC, "-", "-", "-")
-        ppa = self.get_ppa(reference, metrics)
-        gamma = ppa / 10
-        score = ppa * (self.step_ / 100) ** (-1) + (gamma * metrics["num_drc"])
-        effective_clk_period = metrics["clk_period"] - metrics["worst_slack"]
+            return (ERROR_METRIC, "-", "-", "-", "-")
+        score = self.get_ppa(reference, metrics)
+        effective_clk_period = metrics["clk_period"]
+        if metrics["worst_slack"] < 0:
+            effective_clk_period -= metrics["worst_slack"]
+            
         num_drc = metrics["num_drc"]
-        return (score, effective_clk_period, num_drc, metrics["die_area"])
+        return (score, effective_clk_period, metrics["total_power"], metrics["die_area"], num_drc)
 
 
 def parse_arguments():
@@ -415,6 +425,28 @@ def parse_arguments():
         " training stderr\n\t2: also print training stdout.",
     )
 
+    parser.add_argument(
+        "--coeff_perform",
+        type=float,
+        metavar="<float>",
+        default=1,
+        help="Number of CPUs to request for each tuning job.",
+    )
+    parser.add_argument(
+        "--coeff_area",
+        type=float,
+        metavar="<float>",
+        default=1,
+        help="Number of CPUs to request for each tuning job.",
+    )
+    parser.add_argument(
+        "--coeff_power",
+        type=float,
+        metavar="<float>",
+        default=1,
+        help="Number of CPUs to request for each tuning job.",
+    )
+    
     args = parser.parse_args()
     if args.mode == "tune":
         args.algorithm = args.algorithm.lower()

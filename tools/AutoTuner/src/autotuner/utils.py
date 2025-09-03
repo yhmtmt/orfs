@@ -70,7 +70,118 @@ CONSTRAINTS_SDC = "constraint.sdc"
 FASTROUTE_TCL = "fastroute.tcl"
 DATE = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
+def write_sdc(variables, path, sdc_original, constraints_sdc):
+    """
+    Create an SDC file with parameters for current tuning iteration.
 
+    - Replaces numeric -period tokens in create_clock/create_generated_clock.
+    - If -period uses a variable ($var / ${var} / $::env(NAME)), try to find and
+      update the corresponding 'set <var> <value>' line (preserving unit).
+    - If no 'set' exists for that var, inline the numeric value into -period.
+    """
+    if not sdc_original:
+        print("[ERROR TUN-0020] No SDC reference file provided.")
+        sys.exit(1)
+
+    new_file = sdc_original
+
+    # Regexes
+    num = re.compile(r'^([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)$')
+    period_arg = re.compile(r'(-period\s+)(\S+)')
+    # token forms: $var, ${var}, $::env(NAME)
+    var_token = re.compile(r'^\$(?:\{([^}]+)\}|([A-Za-z_:\.][A-Za-z0-9_:\.\(\)]*))$')
+
+    def replace_set_value_for_var(text, var_name, value_str):
+        """
+        Replace 'set <var_name> <old>' -> 'set <var_name> <value_str>'
+        Returns (new_text, did_replace)
+        """
+        var_pat = re.compile(
+            r'(^\s*set\s+' + re.escape(var_name) + r'\s+)([^\s\n;#]+)',
+            flags=re.MULTILINE
+        )
+
+        def _sub(m):
+            prefix = m.group(1)
+            old = m.group(2)
+            mu = num.match(old)
+            return f"{prefix}{value_str}"
+
+        new_text, n = var_pat.subn(_sub, text)
+        return new_text, (n > 0)
+
+    for key, value in variables.items():
+        if key == "CLK_PERIOD":
+            value_str = str(value)
+            vars_to_update = set()
+
+            def _period_rewriter(m):
+                prefix, token = m.group(1), m.group(2)
+
+                # If token is numeric
+                mu = num.match(token)
+                if mu:
+                    return f"{prefix}{value_str}"
+
+                # If token is a variable form, capture the var name to update its 'set'
+                mv = var_token.match(token)
+                if mv:
+                    var_name = mv.group(1) or mv.group(2)  # ${...} vs $name
+                    vars_to_update.add(var_name)
+                    return m.group(0)  # leave unchanged for now
+
+                # Unknown token: fallback to inlining the numeric value 
+                return f"{prefix}{value_str}"
+
+            # First pass: handle numeric -periods and collect variable tokens
+            new_file = period_arg.sub(_period_rewriter, new_file)
+
+            # Second pass: update corresponding 'set' lines for variables used
+            for var_name in vars_to_update:
+                updated_text, did_replace = replace_set_value_for_var(new_file, var_name, value_str)
+                if did_replace:
+                    new_file = updated_text
+                else:
+                    # No set found — inline the numeric value into -period occurrences using this var
+                    inline_pat = re.compile(
+                        r'(-period\s+)\$(?:\{' + re.escape(var_name) + r'\}|' + re.escape(var_name) + r')'
+                    )
+                    new_file, _ = inline_pat.subn(rf'\1{value_str}', new_file)
+
+        elif key == "UNCERTAINTY":
+            if re.search(r'(^|\n)\s*set\s+uncertainty\s+', new_file):
+                new_file = re.sub(
+                    r'(^|\n)(\s*set\s+uncertainty\s+)[0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?[a-zA-Z]*',
+                    rf'\1\2{value}',
+                    new_file,
+                    flags=re.MULTILINE
+                )
+            else:
+                new_file += f"\nset uncertainty {value}\n"
+
+        elif key == "IO_DELAY":
+            if re.search(r'(^|\n)\s*set\s+io_delay\s+', new_file):
+                new_file = re.sub(
+                    r'(^|\n)(\s*set\s+io_delay\s+)[0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?[a-zA-Z]*',
+                    rf'\1\2{value}',
+                    new_file,
+                    flags=re.MULTILINE
+                )
+            else:
+                new_file += f"\nset io_delay {value}\n"
+
+        else:
+            print(f"[WARN TUN-0025] {key} variable not supported in context of SDC files")
+            continue
+    print(f"new_constraint_sdc={new_file}")
+    os.makedirs(path, exist_ok=True)
+    file_name = os.path.join(path, constraints_sdc)
+    with open(file_name, "w") as f:
+        f.write(new_file)
+
+    return file_name
+
+'''
 def write_sdc(variables, path, sdc_original, constraints_sdc):
     """
     Create a SDC file with parameters for current tuning iteration.
@@ -82,11 +193,14 @@ def write_sdc(variables, path, sdc_original, constraints_sdc):
     new_file = sdc_original
     for key, value in variables.items():
         if key == "CLK_PERIOD":
+            print(f"CLK_PERIOD:{value}")
             if new_file.find("set clk_period") != -1:
+                print("set clk_period exist.")
                 new_file = re.sub(
                     r"set clk_period .*\n(.*)", f"set clk_period {value}\n\\1", new_file
                 )
             else:
+                print("set clk_period absent.")
                 new_file = re.sub(
                     r"-period [0-9\.]+ (.*)", f"-period {value} \\1", new_file
                 )
@@ -112,11 +226,12 @@ def write_sdc(variables, path, sdc_original, constraints_sdc):
                 f"[WARN TUN-0025] {key} variable not supported in context of SDC files"
             )
             continue
+    print(f"new_constraint_sdc={new_file}")
     file_name = path + f"/{constraints_sdc}"
     with open(file_name, "w") as file:
         file.write(new_file)
     return file_name
-
+'''
 
 def write_fast_route(variables, path, platform, fr_original, fastroute_tcl):
     """
@@ -225,7 +340,7 @@ def parse_config(
     globals = {}
     
     sdc = {}
-    fast_route = {}
+    fast_route={}
     flow_variables = parse_tunable_variables()
     for key, value in config.items():
         # Keys that begin with underscore need special handling.
@@ -256,7 +371,7 @@ def parse_config(
             if key not in flow_variables:
                 print(f"[ERROR TUN-0017] Variable {key} is not tunable.")
                 sys.exit(1)
-            options += f" {key}={value}"
+            options += f" {key}={value}"    
     if sdc:
         write_sdc(sdc, path, sdc_original, constraints_sdc)
         options += f" SDC_FILE={path}/{constraints_sdc}"
@@ -403,7 +518,6 @@ def read_metrics(file_name, stop_stage):
             wirelength = value["route__wirelength"]
         if stage_name == stop_stage and "timing__setup__ws" in value:
             worst_slack = value["timing__setup__ws"]
-            worst_slack = "ERR" if worst_slack < 0 else worst_slack            
         if stage_name == stop_stage and "power__total" in value:
             total_power = value["power__total"]
         if stage_name == stop_stage and "design__instance__utilization" in value:
@@ -426,6 +540,7 @@ def read_metrics(file_name, stop_stage):
         "wirelength": wirelength,
         "num_drc": num_drc,
     }
+    print(f"metrics@read_metrics={ret}")
     return ret
 
 
@@ -555,15 +670,18 @@ def read_config(file_name, mode, algorithm):
             data = json.load(file)
     except json.JSONDecodeError:
         raise ValueError(f"Invalid JSON file: {file_name}")
+    
     sdc_file = ""
     fr_file = ""
     if mode == "tune" and algorithm == "ax":
         config = list()
     else:
         config = dict()
+        
     for key, value in data.items():
         if key == "best_result":
             continue
+            
         if key == "_SDC_FILE_PATH" and value != "":
             if sdc_file != "":
                 print("[WARNING TUN-0004] Overwriting SDC base file.")
@@ -574,22 +692,13 @@ def read_config(file_name, mode, algorithm):
                 print("[WARNING TUN-0005] Overwriting FastRoute base file.")
             fr_file = read(f"{os.path.dirname(file_name)}/{value}")
             continue
-        if not isinstance(value, dict):
-            # To take care of empty values like _FR_FILE_PATH
-            if mode == "tune" and algorithm == "ax":
-                param_dict = read_tune_ax(key, value)
-                if param_dict:
-                    config.append(param_dict)
-            elif mode == "tune" and algorithm == "pbt":
-                param_dict = read_tune_pbt(key, value)
-                if param_dict:
-                    config[key] = param_dict
-            else:
-                config[key] = value
-        elif mode == "sweep":
+        
+        if mode == "sweep":
             config[key] = read_sweep(value)
         elif mode == "tune" and algorithm == "ax":
-            config.append(read_tune_ax(key, value))
+            param_dict = read_tune_ax(key, value)
+            if param_dict:
+                config.append(param_dict)
         elif mode == "tune" and algorithm == "pbt":
             config[key] = read_tune_pbt(key, value)
         elif mode == "tune":
