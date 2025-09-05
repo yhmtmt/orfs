@@ -91,6 +91,7 @@ from autotuner.utils import (
     parse_config,
     read_config,
     read_metrics,
+    read_reference,
     prepare_ray_server,
     CONSTRAINTS_SDC,
     FASTROUTE_TCL,
@@ -217,17 +218,18 @@ class PPAImprov(AutoTunerBase):
     """
 
     @classmethod
-    def get_ppa(cls, reference, metrics):
+    def get_ppa(cls, reference, metrics, args):
         """
         Compute PPA term for evaluate.
         """
-        args = self.globals.get("args")
-        coeff_perform, coeff_power, coeff_area = args.coeff_perform, args.coeff_power, args.globals.coeff_area
+        coeff_perform, coeff_power, coeff_area = args.coeff_perform, args.coeff_power, args.coeff_area
         #normalize as one
         fac = 1.0 / (coeff_perform + coeff_power + coeff_area)
+
         coeff_perform *= fac
         coeff_power *= fac
         coeff_area *= fac
+        print(f"rescaled coeff_perform={coeff_perform}, coeff_power={coeff_power}, coeff_area={coeff_area}")
 
         eff_clk_period = metrics["clk_period"]
         if metrics["worst_slack"] < 0:
@@ -245,15 +247,16 @@ class PPAImprov(AutoTunerBase):
         ppa = performance * coeff_perform
         ppa += power * coeff_power
         ppa += area * coeff_area
-        return ppa_upper_bound - ppa
+        return ppa
 
     def evaluate(self, metrics):
         reference = self.globals.get("reference")                
+        args = self.globals.get("args")
         error = "ERR" in metrics.values() or "ERR" in reference.values()
         not_found = "N/A" in metrics.values() or "N/A" in reference.values()
         if error or not_found:
             return (ERROR_METRIC, "-", "-", "-", "-")
-        score = self.get_ppa(reference, metrics)
+        score = self.get_ppa(reference, metrics, args)
         effective_clk_period = metrics["clk_period"]
         if metrics["worst_slack"] < 0:
             effective_clk_period -= metrics["worst_slack"]
@@ -365,6 +368,28 @@ def parse_arguments():
         help="Number of CPUs to request for each tuning job.",
     )
     tune_parser.add_argument(
+        "--coeff_perform",
+        type=float,
+        metavar="<float>",
+        default=1,
+        help="Coefficient for performance in PPA calculation.",
+    )
+    tune_parser.add_argument(
+        "--coeff_area",
+        type=float,
+        metavar="<float>",
+        default=1,
+        help="Coefficient for area in PPA calculation.",
+    )
+    tune_parser.add_argument(
+        "--coeff_power",
+        type=float,
+        metavar="<float>",
+        default=1,
+        help="coefficient for power in PPA calculation.",
+    )
+
+    tune_parser.add_argument(
         "--reference",
         type=str,
         metavar="<path>",
@@ -425,27 +450,6 @@ def parse_arguments():
         " training stderr\n\t2: also print training stdout.",
     )
 
-    parser.add_argument(
-        "--coeff_perform",
-        type=float,
-        metavar="<float>",
-        default=1,
-        help="Number of CPUs to request for each tuning job.",
-    )
-    parser.add_argument(
-        "--coeff_area",
-        type=float,
-        metavar="<float>",
-        default=1,
-        help="Number of CPUs to request for each tuning job.",
-    )
-    parser.add_argument(
-        "--coeff_power",
-        type=float,
-        metavar="<float>",
-        default=1,
-        help="Number of CPUs to request for each tuning job.",
-    )
     
     args = parser.parse_args()
     if args.mode == "tune":
@@ -582,7 +586,6 @@ def save_best(results):
         json.dump(results.best_result, new_best_file, indent=4)
     
     print(f"[INFO TUN-0003] Best results written to {new_best_path}")
-    print(f"[INFO TUN-0040] Best metrics written to {best_metric_path}")
 
 
 def sweep(args, config_dict, globals, local_dir, orfs_flow_dir, sdc_original, fr_original, install_path):
@@ -632,9 +635,10 @@ def main():
     
         # The global variables declared in main() do not exist in the execution instances. I embed the global variables into config_dict which is the only parameter passed to setup method of AutoTunerBase. The code is a quick fix the global variables are still used in other parts of the code.
     reference = None
+    best_params = None
     if hasattr(args, "reference"):
-        reference = read_metrics(args.reference, args.stop_stage)
-    print(f"reference={reference}")
+        reference, best_params = read_reference(args.reference, args.stop_stage)
+    print(f"reference={reference} best_params={best_params}")
     
     globals = {
         "local_dir": LOCAL_DIR,
@@ -647,7 +651,12 @@ def main():
     }
     
     if args.mode == "tune":
-        best_params = set_best_params(args.platform, args.design)
+        if best_params is not None:
+            best_params.update({"__globals__" : globals})
+            best_params = [best_params]
+        else:
+            best_params = []
+
         search_algo = set_algorithm(
             args.algorithm,
             args.experiment,

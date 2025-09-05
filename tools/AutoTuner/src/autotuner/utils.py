@@ -173,7 +173,7 @@ def write_sdc(variables, path, sdc_original, constraints_sdc):
         else:
             print(f"[WARN TUN-0025] {key} variable not supported in context of SDC files")
             continue
-    print(f"new_constraint_sdc={new_file}")
+#    print(f"new_constraint_sdc={new_file}")
     os.makedirs(path, exist_ok=True)
     file_name = os.path.join(path, constraints_sdc)
     with open(file_name, "w") as f:
@@ -479,7 +479,15 @@ def openroad(
 
     return metrics_file
 
-
+def read_reference(file_name, stop_stage):
+    try:
+        with open(file_name) as file:
+            reference = json.load(file)
+    except:
+        return None, None
+     
+    return read_metrics(reference["file"], stop_stage), reference["config"]
+    
 def read_metrics(file_name, stop_stage):
     """
     Collects metrics to evaluate the user-defined objective function.
@@ -540,7 +548,7 @@ def read_metrics(file_name, stop_stage):
         "wirelength": wirelength,
         "num_drc": num_drc,
     }
-    print(f"metrics@read_metrics={ret}")
+    #print(f"metrics@read_metrics={ret}")
     return ret
 
 
